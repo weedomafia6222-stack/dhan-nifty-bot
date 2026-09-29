@@ -1,4 +1,4 @@
-dhanhq
+dhanhq==2.0.2
 pandas
 requests
 pytz
