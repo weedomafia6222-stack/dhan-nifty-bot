@@ -5,23 +5,17 @@ from datetime import datetime
 import pytz
 import pandas as pd
 import requests
-from dhanhq import dhanhq
+import yfinance as yf
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-DHAN_CLIENT_ID     = "1106958122"        # Apna 10-digit Dhan ID yahan dalein
-DHAN_ACCESS_TOKEN  = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJ1c2VyUmVnaW9uIjoiUjEiLCJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzkwNzk1NTAyLCJpYXQiOjE3OTA3MDkxMDIsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA2OTU4MTIyIn0.FV96YlgYQsaiuJJjOy-HAVYPGOoHVztT70W8vbR9zEuY7vE9f4JT03tXFRyvdiZVOp20tO_KynqjcPPxDsMLKg"     # Jo token abhi copy kiya wo yahan dalein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Telegram Bot Token dalein
+TELEGRAM_CHAT_ID   = "1327677831"      # Apna Telegram Chat ID dalein
 
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Wahi Telegram Bot Token
-TELEGRAM_CHAT_ID   = "1327677831"      # Wahi Telegram Chat ID
+SYMBOL = "^NSEI"               # Yahoo Finance symbol for Nifty 50 Index
+SWING_LOOKBACK = 12            # Recent 1-hour swings on 5m
+COOLDOWN_MINUTES = 20
 
-SECURITY_ID        = "13"          # Nifty 50 Index on Dhan
-EXCHANGE_SEGMENT   = "IDX_I"
-
-SWING_LOOKBACK     = 12            # Recent 1-hour swings on 5m
-COOLDOWN_MINUTES   = 20
-
-dhan = dhanhq(DHAN_ACCESS_TOKEN)
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -34,31 +28,25 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-def get_resampled_nifty_data():
+def get_nifty_data():
     try:
-        response = dhan.historical_minute_data(
-            security_id=SECURITY_ID,
-            exchange_segment=EXCHANGE_SEGMENT,
-            instrument_type="INDEX"
-        )
-        if not response or 'data' not in response:
+        ticker = yf.Ticker(SYMBOL)
+        # Fetch 5m candles for the last 5 days
+        df_5m = ticker.history(period="5d", interval="5m")
+        if df_5m.empty:
             return None, None
-            
-        raw = pd.DataFrame(response['data'])
-        raw['datetime'] = pd.to_datetime(raw['start_Time']).dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
-        raw.set_index('datetime', inplace=True)
-        raw.sort_index(inplace=True)
 
-        # 5-Minute Timeframe
-        df_5m = raw.resample('5min').agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last'
-        }).dropna()
+        # Convert index to IST
+        if df_5m.index.tz is None:
+            df_5m.index = df_5m.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+        else:
+            df_5m.index = df_5m.index.tz_convert('Asia/Kolkata')
 
-        # 15-Minute Timeframe + 200 EMA
-        df_15m = raw.resample('15min').agg({
+        # Clean column names to lowercase
+        df_5m.columns = [c.lower() for c in df_5m.columns]
+
+        # Resample to 15m for macro trend filter
+        df_15m = df_5m.resample('15min').agg({
             'open': 'first',
             'high': 'max',
             'low': 'min',
@@ -68,7 +56,7 @@ def get_resampled_nifty_data():
 
         return df_5m, df_15m
     except Exception as e:
-        print(f"Data Fetch Error: {e}")
+        print(f"Yahoo Data Fetch Error: {e}")
         return None, None
 
 def get_itm_option(spot_price, trade_type):
@@ -81,12 +69,12 @@ def get_itm_option(spot_price, trade_type):
         return f"{strike} PE"
 
 def nifty_bot_worker():
-    print("🇮🇳 Dhan Multi-Timeframe Nifty Scalper Started...")
+    print("🇮🇳 Hands-Free Nifty 50 Multi-Timeframe Bot Started...")
     send_telegram_alert(
-        "🇮🇳 *NIFTY MULTI-TIMEFRAME SCALPER ACTIVE!*\n\n"
+        "🇮🇳 *NIFTY MULTI-TIMEFRAME SCALPER ACTIVE (ZERO-TOKEN)!*\n\n"
         "📈 *Macro Filter:* 15-Minute 200 EMA\n"
         "⚡ *Trigger:* 5-Minute Liquidity Sweep\n"
-        "🛡 *Anti-Decay:* Deep In-The-Money (ITM) Strike Selection"
+        "🛡 *Anti-Decay:* Deep ITM Strike Recommendation"
     )
 
     last_trade_time = None
@@ -98,22 +86,22 @@ def nifty_bot_worker():
             ist = pytz.timezone('Asia/Kolkata')
             now_ist = datetime.now(ist)
 
-            # Active Market Hours: Mon-Fri, 09:20 AM to 03:15 PM
+            # Active Market Hours: Mon-Fri, 09:20 AM to 03:20 PM
             is_weekday = now_ist.weekday() < 5
             market_start = now_ist.replace(hour=9, minute=20, second=0, microsecond=0)
-            market_end   = now_ist.replace(hour=15, minute=15, second=0, microsecond=0)
+            market_end   = now_ist.replace(hour=15, minute=20, second=0, microsecond=0)
 
             if is_weekday and (market_start <= now_ist <= market_end):
                 if current_day != now_ist.day:
                     current_day = now_ist.day
                     trades_count = 0
 
-                df_5m, df_15m = get_resampled_nifty_data()
+                df_5m, df_15m = get_nifty_data()
 
                 if df_5m is not None and df_15m is not None and len(df_15m) > 10:
                     macro_close = df_15m.iloc[-2]['close']
                     macro_ema   = df_15m.iloc[-2]['ema200']
-                    
+
                     macro_bullish = macro_close > macro_ema
                     macro_bearish = macro_close < macro_ema
 
@@ -134,7 +122,7 @@ def nifty_bot_worker():
                             trigger_5m['low'] < recent_low and 
                             trigger_5m['close'] > recent_low and 
                             trigger_5m['close'] > trigger_5m['open']):
-                            
+
                             itm_contract = get_itm_option(curr_price, "CALL")
                             spot_sl  = round(curr_price - trigger_5m['low'] + 6, 1)
                             spot_tp  = round(spot_sl * 1.3, 1)
@@ -157,7 +145,7 @@ def nifty_bot_worker():
                               trigger_5m['high'] > recent_high and 
                               trigger_5m['close'] < recent_high and 
                               trigger_5m['close'] < trigger_5m['open']):
-                            
+
                             itm_contract = get_itm_option(curr_price, "PUT")
                             spot_sl  = round(trigger_5m['high'] - curr_price + 6, 1)
                             spot_tp  = round(spot_sl * 1.3, 1)
@@ -181,7 +169,7 @@ def nifty_bot_worker():
             print(f"Worker Loop Warning: {e}")
             time.sleep(15)
 
-# Render Port Keep-Alive
+# Render Keep-Alive Port Ping (No Timeout)
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
