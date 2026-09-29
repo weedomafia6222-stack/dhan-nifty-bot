@@ -1,4 +1,4 @@
-dhanhq==2.0.2
+yfinance
 pandas
 requests
 pytz
