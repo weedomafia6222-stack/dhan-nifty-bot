@@ -21,8 +21,7 @@ EXCHANGE_SEGMENT   = "IDX_I"
 SWING_LOOKBACK     = 12            # Recent 1-hour swings on 5m
 COOLDOWN_MINUTES   = 20
 
-dhan = dhanhq(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
-
+dhan = dhanhq(DHAN_ACCESS_TOKEN)
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
