@@ -1,4 +1,4 @@
-curl_cffi
 pandas
 requests
 pytz
+beautifulsoup4
