@@ -5,16 +5,16 @@ from datetime import datetime
 import pytz
 import pandas as pd
 import requests
-import yfinance as yf
+from curl_cffi import requests as cureq
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Telegram Bot Token dalein
-TELEGRAM_CHAT_ID   = "1327677831"      # Apna Telegram Chat ID dalein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Bot Token dalein
+TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID dalein
 
-SYMBOL = "^NSEI"               # Yahoo Finance symbol for Nifty 50 Index
-SWING_LOOKBACK = 12            # Recent 1-hour swings on 5m
-COOLDOWN_MINUTES = 20
+EMA_PERIOD = 50        # Intraday dynamic trend filter
+SWING_LOOKBACK = 10    # Lookback candles
+COOLDOWN_MINUTES = 15
 
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -28,54 +28,50 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-def get_nifty_data():
-    try:
-        ticker = yf.Ticker(SYMBOL)
-        # Fetch 5m candles for the last 5 days
-        df_5m = ticker.history(period="5d", interval="5m")
-        if df_5m.empty:
-            return None, None
-
-        # Convert index to IST
-        if df_5m.index.tz is None:
-            df_5m.index = df_5m.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-        else:
-            df_5m.index = df_5m.index.tz_convert('Asia/Kolkata')
-
-        # Clean column names to lowercase
-        df_5m.columns = [c.lower() for c in df_5m.columns]
-
-        # Resample to 15m for macro trend filter
-        df_15m = df_5m.resample('15min').agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last'
-        }).dropna()
-        df_15m['ema200'] = df_15m['close'].ewm(span=200, adjust=False).mean()
-
-        return df_5m, df_15m
-    except Exception as e:
-        print(f"Yahoo Data Fetch Error: {e}")
-        return None, None
+def fetch_nse_nifty_candles():
+    """Fetches intraday 5m data using browser session bypassing Render block"""
+    url = "https://www.nseindia.com/api/chart-databyindex?index=NIFTY%2050&indices=true"
+    session = cureq.Session(impersonate="chrome120")
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.nseindia.com/",
+        "Accept": "*/*"
+    })
+    
+    # Cookie warmup
+    session.get("https://www.nseindia.com", timeout=10)
+    r = session.get(url, timeout=10)
+    if r.status_code == 200:
+        data = r.json()
+        points = data.get("grapthData", [])
+        if points:
+            records = []
+            for p in points:
+                # [timestamp_ms, price]
+                records.append({
+                    "timestamp": pd.to_datetime(p[0], unit='ms'),
+                    "price": float(p[1])
+                })
+            df = pd.DataFrame(records)
+            df.set_index("timestamp", inplace=True)
+            df.index = df.index.tz_localize("UTC").tz_convert("Asia/Kolkata")
+            
+            # Resample tick data to 5-minute OHLC
+            df_5m = df['price'].resample('5min').ohlc().dropna()
+            df_5m['ema'] = df_5m['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
+            return df_5m
+    return None
 
 def get_itm_option(spot_price, trade_type):
     atm = round(spot_price / 50) * 50
     if trade_type == "CALL":
-        strike = atm - 100
-        return f"{strike} CE"
+        return f"{atm - 50} CE"
     else:
-        strike = atm + 100
-        return f"{strike} PE"
+        return f"{atm + 50} PE"
 
 def nifty_bot_worker():
-    print("🇮🇳 Hands-Free Nifty 50 Multi-Timeframe Bot Started...")
-    send_telegram_alert(
-        "🇮🇳 *NIFTY MULTI-TIMEFRAME SCALPER ACTIVE (ZERO-TOKEN)!*\n\n"
-        "📈 *Macro Filter:* 15-Minute 200 EMA\n"
-        "⚡ *Trigger:* 5-Minute Liquidity Sweep\n"
-        "🛡 *Anti-Decay:* Deep ITM Strike Recommendation"
-    )
+    print("🚀 Nifty 50 NSE Feed Engine Started...")
+    send_telegram_alert("🇮🇳 *NIFTY 50 LIVE BOT ENGAGED!*\nBypassed cloud rate-limits. Monitoring live NSE candles.")
 
     last_trade_time = None
     trades_count = 0
@@ -86,96 +82,91 @@ def nifty_bot_worker():
             ist = pytz.timezone('Asia/Kolkata')
             now_ist = datetime.now(ist)
 
-            # Active Market Hours: Mon-Fri, 09:20 AM to 03:20 PM
+            # Market Hours: 09:15 AM to 03:30 PM (Mon-Fri)
             is_weekday = now_ist.weekday() < 5
-            market_start = now_ist.replace(hour=9, minute=20, second=0, microsecond=0)
-            market_end   = now_ist.replace(hour=15, minute=20, second=0, microsecond=0)
+            market_start = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+            market_end   = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
 
             if is_weekday and (market_start <= now_ist <= market_end):
                 if current_day != now_ist.day:
                     current_day = now_ist.day
                     trades_count = 0
 
-                df_5m, df_15m = get_nifty_data()
+                df_5m = fetch_nse_nifty_candles()
 
-                if df_5m is not None and df_15m is not None and len(df_15m) > 10:
-                    macro_close = df_15m.iloc[-2]['close']
-                    macro_ema   = df_15m.iloc[-2]['ema200']
-
-                    macro_bullish = macro_close > macro_ema
-                    macro_bearish = macro_close < macro_ema
+                if df_5m is not None and len(df_5m) > 15:
+                    curr_price = df_5m.iloc[-1]['close']
+                    last_closed = df_5m.iloc[-2]
+                    ema_val = last_closed['ema']
 
                     recent_high = df_5m['high'].iloc[-(SWING_LOOKBACK + 2):-2].max()
                     recent_low  = df_5m['low'].iloc[-(SWING_LOOKBACK + 2):-2].min()
-                    trigger_5m  = df_5m.iloc[-2]
-                    curr_price  = df_5m.iloc[-1]['close']
 
-                    can_trade = True
+                    print(f"[{now_ist.strftime('%H:%M:%S')}] Nifty: {curr_price:.1f} | EMA: {ema_val:.1f} | Scanning...")
+
+                    cooldown_passed = True
                     if last_trade_time:
                         passed = (now_ist - last_trade_time).total_seconds() / 60
                         if passed < COOLDOWN_MINUTES:
-                            can_trade = False
+                            cooldown_passed = False
 
-                    if can_trade:
-                        # Bullish Setup -> Buy CALL
-                        if (macro_bullish and 
-                            trigger_5m['low'] < recent_low and 
-                            trigger_5m['close'] > recent_low and 
-                            trigger_5m['close'] > trigger_5m['open']):
+                    if cooldown_passed:
+                        # CALL Setup (Bullish Sweep)
+                        if (last_closed['close'] > ema_val and 
+                            last_closed['low'] < recent_low and 
+                            last_closed['close'] > recent_low):
 
-                            itm_contract = get_itm_option(curr_price, "CALL")
-                            spot_sl  = round(curr_price - trigger_5m['low'] + 6, 1)
-                            spot_tp  = round(spot_sl * 1.3, 1)
+                            contract = get_itm_option(curr_price, "CALL")
+                            sl_pts = round(curr_price - last_closed['low'] + 5, 1)
+                            tp_pts = round(sl_pts * 1.3, 1)
                             trades_count += 1
                             last_trade_time = now_ist
 
                             msg = (
-                                f"🟢 *NIFTY 15m+5m CALL BUY #{trades_count}* 🟢\n\n"
-                                f"🎯 *Recommended Contract:* `NIFTY {itm_contract}`\n"
-                                f"🔹 *Nifty Spot:* {curr_price:,.1f}\n"
-                                f"🛑 *Spot SL:* -{spot_sl} pts (Approx ~{round(spot_sl * 0.7)} pts in Premium)\n"
-                                f"🎯 *Spot Target:* +{spot_tp} pts (Approx ~{round(spot_tp * 0.7)} pts in Premium)\n"
-                                f"📈 *15m Trend:* Strong Bullish (> 200 EMA)\n\n"
-                                f"⚡ *Rule:* Deep ITM contract ensures maximum delta & zero theta drag."
+                                f"🟢 *NIFTY 5m CALL BUY #{trades_count}* 🟢\n\n"
+                                f"🎯 *Option Strike:* `NIFTY {contract}`\n"
+                                f"🔹 *Spot Price:* {curr_price:,.1f}\n"
+                                f"🛑 *Spot SL:* -{sl_pts} pts\n"
+                                f"🎯 *Spot Target:* +{tp_pts} pts\n"
+                                f"📈 *Trend:* Bullish (> EMA {EMA_PERIOD})\n\n"
+                                f"⚡ *Scalp Rule:* Trail SL to cost after 15 premium points."
                             )
                             send_telegram_alert(msg)
 
-                        # Bearish Setup -> Buy PUT
-                        elif (macro_bearish and 
-                              trigger_5m['high'] > recent_high and 
-                              trigger_5m['close'] < recent_high and 
-                              trigger_5m['close'] < trigger_5m['open']):
+                        # PUT Setup (Bearish Sweep)
+                        elif (last_closed['close'] < ema_val and 
+                              last_closed['high'] > recent_high and 
+                              last_closed['close'] < recent_high):
 
-                            itm_contract = get_itm_option(curr_price, "PUT")
-                            spot_sl  = round(trigger_5m['high'] - curr_price + 6, 1)
-                            spot_tp  = round(spot_sl * 1.3, 1)
+                            contract = get_itm_option(curr_price, "PUT")
+                            sl_pts = round(last_closed['high'] - curr_price + 5, 1)
+                            tp_pts = round(sl_pts * 1.3, 1)
                             trades_count += 1
                             last_trade_time = now_ist
 
                             msg = (
-                                f"🔴 *NIFTY 15m+5m PUT BUY #{trades_count}* 🔴\n\n"
-                                f"🎯 *Recommended Contract:* `NIFTY {itm_contract}`\n"
-                                f"🔹 *Nifty Spot:* {curr_price:,.1f}\n"
-                                f"🛑 *Spot SL:* +{spot_sl} pts (Approx ~{round(spot_sl * 0.7)} pts in Premium)\n"
-                                f"🎯 *Spot Target:* -{spot_tp} pts (Approx ~{round(spot_tp * 0.7)} pts in Premium)\n"
-                                f"📉 *15m Trend:* Strong Bearish (< 200 EMA)\n\n"
-                                f"⚡ *Rule:* Deep ITM contract ensures maximum delta & zero theta drag."
+                                f"🔴 *NIFTY 5m PUT BUY #{trades_count}* 🔴\n\n"
+                                f"🎯 *Option Strike:* `NIFTY {contract}`\n"
+                                f"🔹 *Spot Price:* {curr_price:,.1f}\n"
+                                f"🛑 *Spot SL:* +{sl_pts} pts\n"
+                                f"🎯 *Spot Target:* -{tp_pts} pts\n"
+                                f"📉 *Trend:* Bearish (< EMA {EMA_PERIOD})\n\n"
+                                f"⚡ *Scalp Rule:* Trail SL to cost after 15 premium points."
                             )
                             send_telegram_alert(msg)
 
-            time.sleep(20)
+            time.sleep(30)
 
         except Exception as e:
-            print(f"Worker Loop Warning: {e}")
-            time.sleep(15)
+            print(f"Data Loop Notice: {e}")
+            time.sleep(20)
 
-# Render Keep-Alive Port Ping (No Timeout)
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Nifty Bot Healthy & Running!")
+        self.wfile.write(b"Nifty Bot Healthy!")
 
     def log_message(self, format, *args):
         return
