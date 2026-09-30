@@ -8,8 +8,8 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Token dalein
-TELEGRAM_CHAT_ID   = "1327677831"      # Chat ID dalein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Token check karein
+TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID check karein
 
 EMA_PERIOD = 20
 COOLDOWN_MINUTES = 10
@@ -19,22 +19,25 @@ INDICES = {
         "name": "NIFTY 50",
         "step": 50,
         "zone": 12,
-        "sl_buf": 6,
-        "opt_ratio": 0.7
+        "sl_buf": 8,
+        "opt_ratio": 0.7,
+        "min_slope": 0.35   # Sideways filter: Flat EMA par trade nahi lega
     },
     "^NSEBANK": {
         "name": "BANKNIFTY",
         "step": 100,
         "zone": 35,
-        "sl_buf": 20,
-        "opt_ratio": 0.65
+        "sl_buf": 25,
+        "opt_ratio": 0.65,
+        "min_slope": 1.2
     },
     "^BSESN": {
         "name": "SENSEX",
         "step": 100,
         "zone": 45,
-        "sl_buf": 25,
-        "opt_ratio": 0.65
+        "sl_buf": 30,
+        "opt_ratio": 0.65,
+        "min_slope": 1.5
     }
 }
 
@@ -60,14 +63,14 @@ def fetch_live_index_spot(symbol):
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        res = requests.get(url, headers=headers, timeout=8)
+        res = requests.get(url, headers=headers, timeout=6)
         if res.status_code == 200:
             data = res.json()
             meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
             curr_price = meta.get("regularMarketPrice")
             return float(curr_price) if curr_price else None
     except Exception as e:
-        print(f"Fetch Error ({symbol}): {e}", flush=True)
+        print(f"Fetch Warning ({symbol}): {e}", flush=True)
     return None
 
 def get_itm_option(name, spot_price, step, trade_type):
@@ -80,8 +83,8 @@ def get_itm_option(name, spot_price, step, trade_type):
         return f"{name} {strike} PE"
 
 def indian_market_worker():
-    print("🚀 Indian Markets Multi-Index Engine Active...", flush=True)
-    send_telegram_alert("🇮🇳 *INDIAN MARKETS TRIO ACTIVE!*\nMonitoring Live Pullbacks on:\n• Nifty 50\n• BankNifty\n• BSE Sensex")
+    print("🚀 Indian Market Multi-Index Scanner Active...", flush=True)
+    send_telegram_alert("🇮🇳 *INDIAN MARKETS SCANNER LIVE!*\nMonitoring Nifty 50, BankNifty & Sensex with Trend-Slope Filter.")
 
     current_day = None
 
@@ -102,7 +105,6 @@ def indian_market_worker():
                         trade_counts[s] = 0
                         history[s].clear()
 
-                status_line = []
                 for symbol, cfg in INDICES.items():
                     spot = fetch_live_index_spot(symbol)
                     if spot:
@@ -117,7 +119,10 @@ def indian_market_worker():
                         recent_low = df['price'].tail(12).min()
                         recent_high = df['price'].tail(12).max()
 
-                        status_line.append(f"{cfg['name']}: {spot:,.0f}")
+                        # Slope calculation over last 3 ticks (Trend momentum check)
+                        slope = 0.0
+                        if len(df) >= 4:
+                            slope = df['ema'].iloc[-1] - df['ema'].iloc[-4]
 
                         cooldown_passed = True
                         if last_trade_times[symbol]:
@@ -126,8 +131,8 @@ def indian_market_worker():
                                 cooldown_passed = False
 
                         if len(df) >= EMA_PERIOD and cooldown_passed:
-                            # 1. Bullish Dip Bounce (CALL)
-                            if spot >= ema_val and (spot - ema_val) <= cfg['zone'] and recent_low < ema_val:
+                            # 1. Bullish Setup: EMA rising (slope > min_slope) + Bounce
+                            if slope > cfg['min_slope'] and spot >= ema_val and (spot - ema_val) <= cfg['zone'] and recent_low < ema_val:
                                 contract = get_itm_option(cfg['name'], spot, cfg['step'], "CALL")
                                 sl_pts = round(spot - recent_low + cfg['sl_buf'], 1)
                                 tp_pts = round(sl_pts * 1.4, 1)
@@ -135,18 +140,18 @@ def indian_market_worker():
                                 last_trade_times[symbol] = now_ist
 
                                 msg = (
-                                    f"🟢 *{cfg['name']} SCALP CALL BUY #{trade_counts[symbol]}* 🟢\n\n"
+                                    f"🟢 *{cfg['name']} CALL BUY #{trade_counts[symbol]}* 🟢\n\n"
                                     f"🎯 *Option Strike:* `{contract}`\n"
                                     f"🔹 *Spot Price:* {spot:,.1f}\n"
                                     f"🛑 *Spot SL:* -{sl_pts} pts (~{round(sl_pts * cfg['opt_ratio'])} pts in option)\n"
                                     f"🎯 *Spot Target:* +{tp_pts} pts (~{round(tp_pts * cfg['opt_ratio'])} pts in option)\n"
-                                    f"📈 *Pattern:* 20-EMA Dynamic Support Rebound\n\n"
-                                    f"⚡ *Rule:* Trail SL to cost after 15-25 option points."
+                                    f"📈 *Trend Slope:* Bullish (+{slope:.2f})\n\n"
+                                    f"⚡ *Rule:* Trail SL to cost after 15-20 option points."
                                 )
                                 send_telegram_alert(msg)
 
-                            # 2. Bearish Pullback Rejection (PUT)
-                            elif spot <= ema_val and (ema_val - spot) <= cfg['zone'] and recent_high > ema_val:
+                            # 2. Bearish Setup: EMA falling (slope < -min_slope) + Rejection
+                            elif slope < -cfg['min_slope'] and spot <= ema_val and (ema_val - spot) <= cfg['zone'] and recent_high > ema_val:
                                 contract = get_itm_option(cfg['name'], spot, cfg['step'], "PUT")
                                 sl_pts = round(recent_high - spot + cfg['sl_buf'], 1)
                                 tp_pts = round(sl_pts * 1.4, 1)
@@ -154,40 +159,45 @@ def indian_market_worker():
                                 last_trade_times[symbol] = now_ist
 
                                 msg = (
-                                    f"🔴 *{cfg['name']} SCALP PUT BUY #{trade_counts[symbol]}* 🔴\n\n"
+                                    f"🔴 *{cfg['name']} PUT BUY #{trade_counts[symbol]}* 🔴\n\n"
                                     f"🎯 *Option Strike:* `{contract}`\n"
                                     f"🔹 *Spot Price:* {spot:,.1f}\n"
                                     f"🛑 *Spot SL:* +{sl_pts} pts (~{round(sl_pts * cfg['opt_ratio'])} pts in option)\n"
                                     f"🎯 *Spot Target:* -{tp_pts} pts (~{round(tp_pts * cfg['opt_ratio'])} pts in option)\n"
-                                    f"📉 *Pattern:* 20-EMA Dynamic Resistance Rejection\n\n"
-                                    f"⚡ *Rule:* Trail SL to cost after 15-25 option points."
+                                    f"📉 *Trend Slope:* Bearish ({slope:.2f})\n\n"
+                                    f"⚡ *Rule:* Trail SL to cost after 15-20 option points."
                                 )
                                 send_telegram_alert(msg)
 
                     time.sleep(1)
 
-                if status_line:
-                    print(f"[{now_ist.strftime('%H:%M:%S')}] Live: {' | '.join(status_line)}", flush=True)
+                if history["^NSEI"]:
+                    last_nifty = history["^NSEI"][-1]["price"]
+                    last_ema = round(pd.DataFrame(history["^NSEI"])['ema'].iloc[-1], 1)
+                    print(f"[{now_ist.strftime('%H:%M:%S')}] Nifty: {last_nifty:,.1f} | EMA: {last_ema:,.1f} | Scanning...", flush=True)
 
             time.sleep(15)
 
         except Exception as e:
-            print(f"Indian Market Scanner Exception: {e}", flush=True)
+            print(f"Scanner Exception: {e}", flush=True)
             time.sleep(10)
 
+# Instant Port Binding Server (Prevents Render Port Scan Timeout)
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Indian Markets Trio Live!")
+        self.wfile.write(b"Nifty Bot Live & Scanning!")
 
     def log_message(self, format, *args):
         return
 
 def run_server():
-    port = int(os.environ.get("PORT", 8080))
+    # Render binds automatically to 10000 or the PORT env var
+    port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f"✅ Web Port Server bound to {port}", flush=True)
     server.serve_forever()
 
 if __name__ == "__main__":
