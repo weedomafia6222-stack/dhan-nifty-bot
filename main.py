@@ -8,8 +8,8 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Token check karein
-TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID check karein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Token dalein
+TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID dalein
 
 EMA_PERIOD = 20
 COOLDOWN_MINUTES = 10
@@ -21,7 +21,7 @@ INDICES = {
         "zone": 12,
         "sl_buf": 8,
         "opt_ratio": 0.7,
-        "min_slope": 0.35   # Sideways filter: Flat EMA par trade nahi lega
+        "min_slope": 0.35
     },
     "^NSEBANK": {
         "name": "BANKNIFTY",
@@ -93,7 +93,6 @@ def indian_market_worker():
             ist = pytz.timezone('Asia/Kolkata')
             now_ist = datetime.now(ist)
 
-            # Mon-Fri 09:15 AM - 03:30 PM
             is_weekday = now_ist.weekday() < 5
             market_start = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
             market_end   = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -104,6 +103,8 @@ def indian_market_worker():
                     for s in INDICES:
                         trade_counts[s] = 0
                         history[s].clear()
+
+                status_list = []
 
                 for symbol, cfg in INDICES.items():
                     spot = fetch_live_index_spot(symbol)
@@ -119,7 +120,8 @@ def indian_market_worker():
                         recent_low = df['price'].tail(12).min()
                         recent_high = df['price'].tail(12).max()
 
-                        # Slope calculation over last 3 ticks (Trend momentum check)
+                        status_list.append(f"{cfg['name']}: {spot:,.0f} (EMA: {ema_val:,.0f})")
+
                         slope = 0.0
                         if len(df) >= 4:
                             slope = df['ema'].iloc[-1] - df['ema'].iloc[-4]
@@ -131,7 +133,7 @@ def indian_market_worker():
                                 cooldown_passed = False
 
                         if len(df) >= EMA_PERIOD and cooldown_passed:
-                            # 1. Bullish Setup: EMA rising (slope > min_slope) + Bounce
+                            # 1. Bullish Setup (Slope > min_slope + Support Bounce)
                             if slope > cfg['min_slope'] and spot >= ema_val and (spot - ema_val) <= cfg['zone'] and recent_low < ema_val:
                                 contract = get_itm_option(cfg['name'], spot, cfg['step'], "CALL")
                                 sl_pts = round(spot - recent_low + cfg['sl_buf'], 1)
@@ -150,7 +152,7 @@ def indian_market_worker():
                                 )
                                 send_telegram_alert(msg)
 
-                            # 2. Bearish Setup: EMA falling (slope < -min_slope) + Rejection
+                            # 2. Bearish Setup (Slope < -min_slope + Resistance Rejection)
                             elif slope < -cfg['min_slope'] and spot <= ema_val and (ema_val - spot) <= cfg['zone'] and recent_high > ema_val:
                                 contract = get_itm_option(cfg['name'], spot, cfg['step'], "PUT")
                                 sl_pts = round(recent_high - spot + cfg['sl_buf'], 1)
@@ -171,10 +173,8 @@ def indian_market_worker():
 
                     time.sleep(1)
 
-                if history["^NSEI"]:
-                    last_nifty = history["^NSEI"][-1]["price"]
-                    last_ema = round(pd.DataFrame(history["^NSEI"])['ema'].iloc[-1], 1)
-                    print(f"[{now_ist.strftime('%H:%M:%S')}] Nifty: {last_nifty:,.1f} | EMA: {last_ema:,.1f} | Scanning...", flush=True)
+                if status_list:
+                    print(f"[{now_ist.strftime('%H:%M:%S')}] Live: {' | '.join(status_list)}", flush=True)
 
             time.sleep(15)
 
@@ -182,22 +182,19 @@ def indian_market_worker():
             print(f"Scanner Exception: {e}", flush=True)
             time.sleep(10)
 
-# Instant Port Binding Server (Prevents Render Port Scan Timeout)
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Nifty Bot Live & Scanning!")
+        self.wfile.write(b"Indian Markets Trio Live & Scanning!")
 
     def log_message(self, format, *args):
         return
 
 def run_server():
-    # Render binds automatically to 10000 or the PORT env var
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    print(f"✅ Web Port Server bound to {port}", flush=True)
     server.serve_forever()
 
 if __name__ == "__main__":
