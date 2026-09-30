@@ -9,11 +9,11 @@ from curl_cffi import requests as cureq
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Bot Token dalein
-TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID dalein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Telegram Token yahan dalein
+TELEGRAM_CHAT_ID   = "1327677831"      # Telegram Chat ID yahan dalein
 
-EMA_PERIOD = 50        # Intraday dynamic trend filter
-SWING_LOOKBACK = 10    # Lookback candles
+EMA_PERIOD = 50        # Intraday 5m EMA filter
+SWING_LOOKBACK = 10    # Last 10 candles high/low
 COOLDOWN_MINUTES = 15
 
 def send_telegram_alert(message):
@@ -29,7 +29,6 @@ def send_telegram_alert(message):
         print(f"Telegram Error: {e}")
 
 def fetch_nse_nifty_candles():
-    """Fetches intraday 5m data using browser session bypassing Render block"""
     url = "https://www.nseindia.com/api/chart-databyindex?index=NIFTY%2050&indices=true"
     session = cureq.Session(impersonate="chrome120")
     session.headers.update({
@@ -38,28 +37,28 @@ def fetch_nse_nifty_candles():
         "Accept": "*/*"
     })
     
-    # Cookie warmup
-    session.get("https://www.nseindia.com", timeout=10)
-    r = session.get(url, timeout=10)
-    if r.status_code == 200:
-        data = r.json()
-        points = data.get("grapthData", [])
-        if points:
-            records = []
-            for p in points:
-                # [timestamp_ms, price]
-                records.append({
-                    "timestamp": pd.to_datetime(p[0], unit='ms'),
-                    "price": float(p[1])
-                })
-            df = pd.DataFrame(records)
-            df.set_index("timestamp", inplace=True)
-            df.index = df.index.tz_localize("UTC").tz_convert("Asia/Kolkata")
-            
-            # Resample tick data to 5-minute OHLC
-            df_5m = df['price'].resample('5min').ohlc().dropna()
-            df_5m['ema'] = df_5m['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
-            return df_5m
+    try:
+        session.get("https://www.nseindia.com", timeout=8)
+        r = session.get(url, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            points = data.get("grapthData", [])
+            if points:
+                records = []
+                for p in points:
+                    records.append({
+                        "timestamp": pd.to_datetime(p[0], unit='ms'),
+                        "price": float(p[1])
+                    })
+                df = pd.DataFrame(records)
+                df.set_index("timestamp", inplace=True)
+                df.index = df.index.tz_localize("UTC").tz_convert("Asia/Kolkata")
+                
+                df_5m = df['price'].resample('5min').ohlc().dropna()
+                df_5m['ema'] = df_5m['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
+                return df_5m
+    except Exception as err:
+        print(f"Fetch Warning: {err}")
     return None
 
 def get_itm_option(spot_price, trade_type):
@@ -82,7 +81,7 @@ def nifty_bot_worker():
             ist = pytz.timezone('Asia/Kolkata')
             now_ist = datetime.now(ist)
 
-            # Market Hours: 09:15 AM to 03:30 PM (Mon-Fri)
+            # Active Market Hours: Mon-Fri, 09:15 AM to 03:30 PM
             is_weekday = now_ist.weekday() < 5
             market_start = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
             market_end   = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -94,7 +93,7 @@ def nifty_bot_worker():
 
                 df_5m = fetch_nse_nifty_candles()
 
-                if df_5m is not None and len(df_5m) > 15:
+                if df_5m is not None and len(df_5m) > 12:
                     curr_price = df_5m.iloc[-1]['close']
                     last_closed = df_5m.iloc[-2]
                     ema_val = last_closed['ema']
@@ -102,7 +101,7 @@ def nifty_bot_worker():
                     recent_high = df_5m['high'].iloc[-(SWING_LOOKBACK + 2):-2].max()
                     recent_low  = df_5m['low'].iloc[-(SWING_LOOKBACK + 2):-2].min()
 
-                    print(f"[{now_ist.strftime('%H:%M:%S')}] Nifty: {curr_price:.1f} | EMA: {ema_val:.1f} | Scanning...")
+                    print(f"[{now_ist.strftime('%H:%M:%S')}] Nifty Spot: {curr_price:.1f} | EMA: {ema_val:.1f} | Scanning...")
 
                     cooldown_passed = True
                     if last_trade_time:
@@ -117,7 +116,7 @@ def nifty_bot_worker():
                             last_closed['close'] > recent_low):
 
                             contract = get_itm_option(curr_price, "CALL")
-                            sl_pts = round(curr_price - last_closed['low'] + 5, 1)
+                            sl_pts = round(curr_price - last_closed['low'] + 6, 1)
                             tp_pts = round(sl_pts * 1.3, 1)
                             trades_count += 1
                             last_trade_time = now_ist
@@ -139,7 +138,7 @@ def nifty_bot_worker():
                               last_closed['close'] < recent_high):
 
                             contract = get_itm_option(curr_price, "PUT")
-                            sl_pts = round(last_closed['high'] - curr_price + 5, 1)
+                            sl_pts = round(last_closed['high'] - curr_price + 6, 1)
                             tp_pts = round(sl_pts * 1.3, 1)
                             trades_count += 1
                             last_trade_time = now_ist
@@ -158,7 +157,7 @@ def nifty_bot_worker():
             time.sleep(30)
 
         except Exception as e:
-            print(f"Data Loop Notice: {e}")
+            print(f"Loop Notice: {e}")
             time.sleep(20)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -166,7 +165,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Nifty Bot Healthy!")
+        self.wfile.write(b"Nifty Bot Live & Scanning!")
 
     def log_message(self, format, *args):
         return
