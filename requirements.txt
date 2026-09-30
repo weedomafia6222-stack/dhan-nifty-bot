@@ -1,5 +1,4 @@
-nselib
+curl_cffi
 pandas
 requests
 pytz
-curl_cffi
