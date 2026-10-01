@@ -1,47 +1,35 @@
 import os
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, time as dtime
 import pytz
 import pandas as pd
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Token dalein
-TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID dalein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"
+TELEGRAM_CHAT_ID   = "1327677831"
 
-EMA_PERIOD = 20
-COOLDOWN_MINUTES = 10
+COOLDOWN_MINUTES = 35
 
 INDICES = {
     "^NSEI": {
         "name": "NIFTY 50",
         "step": 50,
-        "zone": 12,
-        "sl_buf": 8,
-        "opt_ratio": 0.7,
-        "min_slope": 0.35
+        "sl_buf": 8.0,
+        "rr": 2.0,
+        "opt_ratio": 0.70
     },
     "^NSEBANK": {
         "name": "BANKNIFTY",
         "step": 100,
-        "zone": 35,
-        "sl_buf": 25,
-        "opt_ratio": 0.65,
-        "min_slope": 1.2
-    },
-    "^BSESN": {
-        "name": "SENSEX",
-        "step": 100,
-        "zone": 45,
-        "sl_buf": 30,
-        "opt_ratio": 0.65,
-        "min_slope": 1.5
+        "sl_buf": 25.0,
+        "rr": 2.0,
+        "opt_ratio": 0.65
     }
 }
 
-history = {symbol: [] for symbol in INDICES}
 last_trade_times = {symbol: None for symbol in INDICES}
 trade_counts = {symbol: 0 for symbol in INDICES}
 
@@ -53,40 +41,124 @@ def send_telegram_alert(message):
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, data=payload, timeout=10)
+        requests.post(url, data=payload, timeout=8)
     except Exception as e:
         print(f"Telegram Error: {e}", flush=True)
 
-def fetch_live_index_spot(symbol):
+def fetch_5m_candles(symbol):
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=5m&range=2d"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
-        res = requests.get(url, headers=headers, timeout=6)
+        res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200:
             data = res.json()
-            meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
-            curr_price = meta.get("regularMarketPrice")
-            return float(curr_price) if curr_price else None
+            res_data = data.get("chart", {}).get("result", [{}])[0]
+            timestamps = res_data.get("timestamp", [])
+            indicators = res_data.get("indicators", {}).get("quote", [{}])[0]
+
+            if not timestamps or not indicators.get("close"):
+                return None
+
+            df = pd.DataFrame({
+                "timestamp": timestamps,
+                "open": indicators.get("open"),
+                "high": indicators.get("high"),
+                "low": indicators.get("low"),
+                "close": indicators.get("close")
+            }).dropna().reset_index(drop=True)
+
+            # IST Timestamp convert
+            ist = pytz.timezone('Asia/Kolkata')
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='s').dt.tz_localize('UTC').dt.tz_convert(ist)
+            return df
     except Exception as e:
-        print(f"Fetch Warning ({symbol}): {e}", flush=True)
+        print(f"Fetch Error ({symbol}): {e}", flush=True)
     return None
 
 def get_itm_option(name, spot_price, step, trade_type):
     atm = round(spot_price / step) * step
-    if trade_type == "CALL":
-        strike = atm - step
-        return f"{name} {strike} CE"
-    else:
-        strike = atm + step
-        return f"{name} {strike} PE"
+    strike = (atm - step) if trade_type == "CALL" else (atm + step)
+    suffix = "CE" if trade_type == "CALL" else "PE"
+    return f"{name} {strike} {suffix}"
+
+def check_high_accuracy_setup(df, cfg, now_ist):
+    """
+    LOGIC:
+    1. First 15m Range (09:15 - 09:30) Breakout Direction Filter
+    2. EMA 9 & EMA 21 Trend Stack
+    3. Rejection / Pullback Confirmation at EMA 9
+    """
+    if df is None or len(df) < 25:
+        return None
+
+    # Filter Today's Candles
+    today_candles = df[df['datetime'].dt.date == now_ist.date()].copy()
+    if len(today_candles) < 4:  # Pehle 15-20 min koi trade nahi
+        return None
+
+    # First 3 candles define Opening Range (09:15, 09:20, 09:25)
+    first_15m = today_candles.iloc[:3]
+    orb_high = first_15m['high'].max()
+    orb_low  = first_15m['low'].min()
+
+    # EMAs Calculation
+    df['ema9']  = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+
+    prev_candle = df.iloc[-2]  # Just closed candle
+    curr_candle = df.iloc[-1]  # Active breakout candle
+
+    ema9 = prev_candle['ema9']
+    ema21 = prev_candle['ema21']
+
+    # --- 1. HIGH ACCURACY CALL SETUP ---
+    # Trend: 9 EMA > 21 EMA & Price > ORB High
+    bullish_structure = (ema9 > ema21) and (prev_candle['close'] > orb_high)
+    # Pullback to 9 EMA (Low touched near EMA9 but closed above it)
+    bull_pullback = (prev_candle['low'] <= (ema9 * 1.001)) and (prev_candle['close'] > ema9)
+    # Trigger: Current candle breaks previous pullback high
+    if bullish_structure and bull_pullback and (curr_candle['close'] > prev_candle['high']):
+        sl = round(prev_candle['low'] - cfg['sl_buf'], 1)
+        risk = round(curr_candle['close'] - sl, 1)
+        if 15 <= risk <= 45 if "NIFTY" in cfg['name'] else 35 <= risk <= 120:
+            tp = round(curr_candle['close'] + (risk * cfg['rr']), 1)
+            return {
+                "side": "CALL",
+                "entry": curr_candle['close'],
+                "sl": sl,
+                "tp": tp,
+                "risk": risk,
+                "reward": round(risk * cfg['rr'], 1),
+                "reason": "15m ORB + 9 EMA Pullback"
+            }
+
+    # --- 2. HIGH ACCURACY PUT SETUP ---
+    # Trend: 9 EMA < 21 EMA & Price < ORB Low
+    bearish_structure = (ema9 < ema21) and (prev_candle['close'] < orb_low)
+    # Pullback to 9 EMA (High touched near EMA9 but closed below it)
+    bear_pullback = (prev_candle['high'] >= (ema9 * 0.999)) and (prev_candle['close'] < ema9)
+    # Trigger: Current candle breaks previous pullback low
+    if bearish_structure and bear_pullback and (curr_candle['close'] < prev_candle['low']):
+        sl = round(prev_candle['high'] + cfg['sl_buf'], 1)
+        risk = round(sl - curr_candle['close'], 1)
+        if 15 <= risk <= 45 if "NIFTY" in cfg['name'] else 35 <= risk <= 120:
+            tp = round(curr_candle['close'] - (risk * cfg['rr']), 1)
+            return {
+                "side": "PUT",
+                "entry": curr_candle['close'],
+                "sl": sl,
+                "tp": tp,
+                "risk": risk,
+                "reward": round(risk * cfg['rr'], 1),
+                "reason": "15m ORB + 9 EMA Pullback"
+            }
+
+    return None
 
 def indian_market_worker():
-    print("🚀 Indian Market Multi-Index Scanner Active...", flush=True)
-    send_telegram_alert("🇮🇳 *INDIAN MARKETS SCANNER LIVE!*\nMonitoring Nifty 50, BankNifty & Sensex with Trend-Slope Filter.")
-
-    current_day = None
+    print("🚀 Indian Market High-Accuracy ORB+EMA Scanner Live...", flush=True)
 
     while True:
         try:
@@ -94,100 +166,56 @@ def indian_market_worker():
             now_ist = datetime.now(ist)
 
             is_weekday = now_ist.weekday() < 5
-            market_start = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-            market_end   = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+            # Trade window: 09:35 AM to 03:00 PM (No late-market noise)
+            market_start = now_ist.replace(hour=9, minute=35, second=0, microsecond=0)
+            market_end   = now_ist.replace(hour=15, minute=0, second=0, microsecond=0)
 
             if is_weekday and (market_start <= now_ist <= market_end):
-                if current_day != now_ist.day:
-                    current_day = now_ist.day
-                    for s in INDICES:
-                        trade_counts[s] = 0
-                        history[s].clear()
-
-                status_list = []
-
                 for symbol, cfg in INDICES.items():
-                    spot = fetch_live_index_spot(symbol)
-                    if spot:
-                        history[symbol].append({"time": now_ist, "price": spot})
-                        if len(history[symbol]) > 60:
-                            history[symbol].pop(0)
+                    if last_trade_times[symbol]:
+                        passed_min = (now_ist - last_trade_times[symbol]).total_seconds() / 60
+                        if passed_min < COOLDOWN_MINUTES:
+                            continue
 
-                        df = pd.DataFrame(history[symbol])
-                        df['ema'] = df['price'].ewm(span=EMA_PERIOD, adjust=False).mean()
+                    df = fetch_5m_candles(symbol)
+                    time.sleep(0.5)
 
-                        ema_val = round(df['ema'].iloc[-1], 1)
-                        recent_low = df['price'].tail(12).min()
-                        recent_high = df['price'].tail(12).max()
+                    setup = check_high_accuracy_setup(df, cfg, now_ist)
+                    if setup:
+                        trade_type = setup['side']
+                        contract = get_itm_option(cfg['name'], setup['entry'], cfg['step'], trade_type)
 
-                        status_list.append(f"{cfg['name']}: {spot:,.0f} (EMA: {ema_val:,.0f})")
+                        trade_counts[symbol] += 1
+                        last_trade_times[symbol] = now_ist
 
-                        slope = 0.0
-                        if len(df) >= 4:
-                            slope = df['ema'].iloc[-1] - df['ema'].iloc[-4]
+                        icon = "🟢" if trade_type == "CALL" else "🔴"
+                        opt_sl = round(setup['risk'] * cfg['opt_ratio'])
+                        opt_tp = round(setup['reward'] * cfg['opt_ratio'])
 
-                        cooldown_passed = True
-                        if last_trade_times[symbol]:
-                            passed = (now_ist - last_trade_times[symbol]).total_seconds() / 60
-                            if passed < COOLDOWN_MINUTES:
-                                cooldown_passed = False
+                        msg = (
+                            f"{icon} *{cfg['name']} HIGH ACCURACY {trade_type}* {icon}\n\n"
+                            f"📌 *Strategy:* {setup['reason']}\n"
+                            f"🎯 *Suggested Strike:* `{contract}`\n"
+                            f"🔹 *Index Spot Price:* ₹{setup['entry']:,.1f}\n"
+                            f"🎯 *Spot Target (1:{cfg['rr']}):* ₹{setup['tp']:,.1f} (+{setup['reward']} pts)\n"
+                            f"🛑 *Spot SL:* ₹{setup['sl']:,.1f} (-{setup['risk']} pts)\n"
+                            f"📊 *Approx Option SL:* -{opt_sl} pts | *Target:* +{opt_tp} pts\n\n"
+                            f"⚡ *Rule:* Premium mein 20+ points aate hi SL Cost-to-Cost shift karein."
+                        )
+                        send_telegram_alert(msg)
 
-                        if len(df) >= EMA_PERIOD and cooldown_passed:
-                            # 1. Bullish Setup (Slope > min_slope + Support Bounce)
-                            if slope > cfg['min_slope'] and spot >= ema_val and (spot - ema_val) <= cfg['zone'] and recent_low < ema_val:
-                                contract = get_itm_option(cfg['name'], spot, cfg['step'], "CALL")
-                                sl_pts = round(spot - recent_low + cfg['sl_buf'], 1)
-                                tp_pts = round(sl_pts * 1.4, 1)
-                                trade_counts[symbol] += 1
-                                last_trade_times[symbol] = now_ist
-
-                                msg = (
-                                    f"🟢 *{cfg['name']} CALL BUY #{trade_counts[symbol]}* 🟢\n\n"
-                                    f"🎯 *Option Strike:* `{contract}`\n"
-                                    f"🔹 *Spot Price:* {spot:,.1f}\n"
-                                    f"🛑 *Spot SL:* -{sl_pts} pts (~{round(sl_pts * cfg['opt_ratio'])} pts in option)\n"
-                                    f"🎯 *Spot Target:* +{tp_pts} pts (~{round(tp_pts * cfg['opt_ratio'])} pts in option)\n"
-                                    f"📈 *Trend Slope:* Bullish (+{slope:.2f})\n\n"
-                                    f"⚡ *Rule:* Trail SL to cost after 15-20 option points."
-                                )
-                                send_telegram_alert(msg)
-
-                            # 2. Bearish Setup (Slope < -min_slope + Resistance Rejection)
-                            elif slope < -cfg['min_slope'] and spot <= ema_val and (ema_val - spot) <= cfg['zone'] and recent_high > ema_val:
-                                contract = get_itm_option(cfg['name'], spot, cfg['step'], "PUT")
-                                sl_pts = round(recent_high - spot + cfg['sl_buf'], 1)
-                                tp_pts = round(sl_pts * 1.4, 1)
-                                trade_counts[symbol] += 1
-                                last_trade_times[symbol] = now_ist
-
-                                msg = (
-                                    f"🔴 *{cfg['name']} PUT BUY #{trade_counts[symbol]}* 🔴\n\n"
-                                    f"🎯 *Option Strike:* `{contract}`\n"
-                                    f"🔹 *Spot Price:* {spot:,.1f}\n"
-                                    f"🛑 *Spot SL:* +{sl_pts} pts (~{round(sl_pts * cfg['opt_ratio'])} pts in option)\n"
-                                    f"🎯 *Spot Target:* -{tp_pts} pts (~{round(tp_pts * cfg['opt_ratio'])} pts in option)\n"
-                                    f"📉 *Trend Slope:* Bearish ({slope:.2f})\n\n"
-                                    f"⚡ *Rule:* Trail SL to cost after 15-20 option points."
-                                )
-                                send_telegram_alert(msg)
-
-                    time.sleep(1)
-
-                if status_list:
-                    print(f"[{now_ist.strftime('%H:%M:%S')}] Live: {' | '.join(status_list)}", flush=True)
-
-            time.sleep(15)
+            time.sleep(25)
 
         except Exception as e:
-            print(f"Scanner Exception: {e}", flush=True)
-            time.sleep(10)
+            print(f"Worker Error: {e}", flush=True)
+            time.sleep(15)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Indian Markets Trio Live & Scanning!")
+        self.wfile.write(b"High Accuracy Indian Scanner Alive!")
 
     def log_message(self, format, *args):
         return
